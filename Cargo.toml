@@ -1,0 +1,12 @@
+[package]
+name = "deep_net"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.24"
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.1"
+rand = "0.8"
+rand_chacha = "0.3"
+ureq = "2.12"

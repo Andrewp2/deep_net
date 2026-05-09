@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use flate2::read::GzDecoder;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -15,6 +15,13 @@ const LAYER_FLOATS: usize = 6;
 const LAYER_BYTES: u64 = (LAYER_FLOATS * std::mem::size_of::<f32>()) as u64;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Activation {
+    Tanh,
+    Softsign,
+    Relu,
+}
 
 #[derive(Parser)]
 #[command(version, about = "Disk-backed absurdly deep width-2 MNIST experiment")]
@@ -121,6 +128,8 @@ enum Command {
         chunk_layers: usize,
         #[arg(long)]
         alpha: Option<f32>,
+        #[arg(long, value_enum, default_value_t = Activation::Tanh)]
+        activation: Activation,
         #[arg(long, default_value_t = 0.01)]
         layer_lr: f32,
         #[arg(long, default_value_t = 0.01)]
@@ -133,6 +142,9 @@ enum Command {
         init_if_missing: bool,
         #[arg(long, default_value_t = 1)]
         report_every: usize,
+        /// Load the full dense weight file into RAM, train there, then write it once at the end.
+        #[arg(long, default_value_t = false)]
+        in_memory: bool,
     },
     /// Evaluate a dense variable-width residual core on MNIST.
     EvalDense {
@@ -154,6 +166,8 @@ enum Command {
         chunk_layers: usize,
         #[arg(long)]
         alpha: Option<f32>,
+        #[arg(long, value_enum, default_value_t = Activation::Tanh)]
+        activation: Activation,
     },
     /// Train a practical MNIST MLP head for low loss.
     TrainMlp {
@@ -268,12 +282,14 @@ fn main() -> Result<()> {
             batch,
             chunk_layers,
             alpha,
+            activation,
             layer_lr,
             head_lr,
             seed,
             train_limit,
             init_if_missing,
             report_every,
+            in_memory,
         } => train_dense(DenseTrainConfig {
             layers,
             width,
@@ -284,12 +300,14 @@ fn main() -> Result<()> {
             batch,
             chunk_layers,
             alpha: alpha.unwrap_or_else(|| default_alpha(layers)),
+            activation,
             layer_lr,
             head_lr,
             seed,
             train_limit,
             init_if_missing,
             report_every,
+            in_memory,
         }),
         Command::EvalDense {
             layers,
@@ -301,6 +319,7 @@ fn main() -> Result<()> {
             batch,
             chunk_layers,
             alpha,
+            activation,
         } => eval_dense(DenseEvalConfig {
             layers,
             width,
@@ -311,6 +330,7 @@ fn main() -> Result<()> {
             batch,
             chunk_layers,
             alpha: alpha.unwrap_or_else(|| default_alpha(layers)),
+            activation,
         }),
         Command::TrainMlp {
             head,
@@ -390,12 +410,14 @@ struct DenseTrainConfig {
     batch: usize,
     chunk_layers: usize,
     alpha: f32,
+    activation: Activation,
     layer_lr: f32,
     head_lr: f32,
     seed: u64,
     train_limit: usize,
     init_if_missing: bool,
     report_every: usize,
+    in_memory: bool,
 }
 
 struct DenseEvalConfig {
@@ -408,6 +430,7 @@ struct DenseEvalConfig {
     batch: usize,
     chunk_layers: usize,
     alpha: f32,
+    activation: Activation,
 }
 
 struct MlpTrainConfig {
@@ -980,6 +1003,18 @@ fn train_dense(cfg: DenseTrainConfig) -> Result<()> {
         .read(true)
         .write(true)
         .open(&cfg.weights)?;
+    let mut memory_weights = if cfg.in_memory {
+        let started = Instant::now();
+        let weights = read_all_dense_weights(&file, cfg.layers, cfg.width)?;
+        println!(
+            "loaded weights into RAM in {:.2?} ({:.3} GB)",
+            started.elapsed(),
+            bytemuck::cast_slice::<f32, u8>(&weights).len() as f64 / 1.0e9
+        );
+        Some(weights)
+    } else {
+        None
+    };
 
     let train_len = cfg.train_limit.min(mnist.train_len());
     if train_len == 0 {
@@ -988,10 +1023,11 @@ fn train_dense(cfg: DenseTrainConfig) -> Result<()> {
 
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
     println!(
-        "train-dense layers={} width={} alpha={} batch={} chunk_layers={} train_len={} weight_file={:.3} GB",
+        "train-dense layers={} width={} alpha={} activation={:?} batch={} chunk_layers={} train_len={} weight_file={:.3} GB",
         cfg.layers,
         cfg.width,
         cfg.alpha,
+        cfg.activation,
         cfg.batch,
         cfg.chunk_layers,
         train_len,
@@ -1005,17 +1041,33 @@ fn train_dense(cfg: DenseTrainConfig) -> Result<()> {
         }
 
         let started = Instant::now();
-        let stats = dense_train_step(
-            &file,
-            &mut head,
-            &mnist,
-            &indices,
-            cfg.layers,
-            cfg.chunk_layers,
-            cfg.alpha,
-            cfg.layer_lr,
-            cfg.head_lr,
-        )?;
+        let stats = if let Some(weights) = memory_weights.as_mut() {
+            dense_train_step_mem(
+                weights,
+                &mut head,
+                &mnist,
+                &indices,
+                cfg.layers,
+                cfg.chunk_layers,
+                cfg.alpha,
+                cfg.activation,
+                cfg.layer_lr,
+                cfg.head_lr,
+            )?
+        } else {
+            dense_train_step(
+                &file,
+                &mut head,
+                &mnist,
+                &indices,
+                cfg.layers,
+                cfg.chunk_layers,
+                cfg.alpha,
+                cfg.activation,
+                cfg.layer_lr,
+                cfg.head_lr,
+            )?
+        };
         head.save(&cfg.head)?;
 
         let elapsed = started.elapsed();
@@ -1034,6 +1086,12 @@ fn train_dense(cfg: DenseTrainConfig) -> Result<()> {
                 throughput / 1.0e6
             );
         }
+    }
+
+    if let Some(weights) = memory_weights.as_ref() {
+        let started = Instant::now();
+        write_all_dense_weights(&file, weights)?;
+        println!("wrote RAM weights to disk in {:.2?}", started.elapsed());
     }
 
     file.sync_data()?;
@@ -1074,6 +1132,7 @@ fn eval_dense(cfg: DenseEvalConfig) -> Result<()> {
             cfg.layers,
             cfg.chunk_layers,
             cfg.alpha,
+            cfg.activation,
         )?;
 
         let stats = dense_eval_output(&head, &h, &mnist.test_labels, &indices);
@@ -1195,6 +1254,7 @@ fn dense_train_step(
     layers: u64,
     chunk_layers: usize,
     alpha: f32,
+    activation: Activation,
     layer_lr: f32,
     head_lr: f32,
 ) -> Result<StepStats> {
@@ -1208,7 +1268,7 @@ fn dense_train_step(
     for chunk_idx in 0..chunks {
         let (start_layer, count) = chunk_range(chunk_idx, layers, chunk_layers);
         let params = read_dense_chunk(file, start_layer, count, width)?;
-        dense_forward_chunk(&params, width, &mut h, alpha);
+        dense_forward_chunk(&params, width, &mut h, alpha, activation);
         checkpoints.push(h.clone());
     }
 
@@ -1225,9 +1285,79 @@ fn dense_train_step(
             &grad_h,
             batch,
             alpha,
+            activation,
             layer_lr,
         );
         write_dense_chunk(file, start_layer, width, &params)?;
+    }
+
+    dense_input_backward_update(
+        head,
+        &mnist.train_images,
+        indices,
+        &checkpoints[0],
+        &grad_h,
+        head_lr,
+    );
+
+    Ok(stats)
+}
+
+fn dense_train_step_mem(
+    weights: &mut [f32],
+    head: &mut DenseHead,
+    mnist: &Mnist,
+    indices: &[usize],
+    layers: u64,
+    chunk_layers: usize,
+    alpha: f32,
+    activation: Activation,
+    layer_lr: f32,
+    head_lr: f32,
+) -> Result<StepStats> {
+    let width = head.width;
+    let batch = indices.len();
+    let chunks = div_ceil(layers, chunk_layers as u64) as usize;
+    let layer_floats = dense_layer_floats(width);
+    let expected_floats = dense_total_floats(layers, width)?;
+    if weights.len() != expected_floats {
+        return Err(format!(
+            "RAM weight slice has {} floats, expected {}",
+            weights.len(),
+            expected_floats
+        )
+        .into());
+    }
+
+    let mut h = dense_input_forward(head, &mnist.train_images, indices);
+    let mut checkpoints = Vec::with_capacity(chunks + 1);
+    checkpoints.push(h.clone());
+
+    for chunk_idx in 0..chunks {
+        let (start_layer, count) = chunk_range(chunk_idx, layers, chunk_layers);
+        let start = start_layer as usize * layer_floats;
+        let end = start + count * layer_floats;
+        dense_forward_chunk(&weights[start..end], width, &mut h, alpha, activation);
+        checkpoints.push(h.clone());
+    }
+
+    let (stats, mut grad_h) =
+        dense_output_loss_backward_update(head, &h, &mnist.train_labels, indices, head_lr);
+
+    for chunk_idx in (0..chunks).rev() {
+        let (start_layer, count) = chunk_range(chunk_idx, layers, chunk_layers);
+        let start = start_layer as usize * layer_floats;
+        let end = start + count * layer_floats;
+        grad_h = dense_backward_chunk(
+            &mut weights[start..end],
+            width,
+            &checkpoints[chunk_idx],
+            &grad_h,
+            batch,
+            alpha,
+            activation,
+            layer_lr,
+        );
     }
 
     dense_input_backward_update(
@@ -1249,12 +1379,13 @@ fn dense_forward_all_layers(
     layers: u64,
     chunk_layers: usize,
     alpha: f32,
+    activation: Activation,
 ) -> Result<()> {
     let chunks = div_ceil(layers, chunk_layers as u64) as usize;
     for chunk_idx in 0..chunks {
         let (start_layer, count) = chunk_range(chunk_idx, layers, chunk_layers);
         let params = read_dense_chunk(file, start_layer, count, width)?;
-        dense_forward_chunk(&params, width, h, alpha);
+        dense_forward_chunk(&params, width, h, alpha, activation);
     }
     Ok(())
 }
@@ -1328,7 +1459,18 @@ fn dense_input_backward_update(
     }
 }
 
-fn dense_forward_chunk(params: &[f32], width: usize, h: &mut [f32], alpha: f32) {
+fn dense_forward_chunk(
+    params: &[f32],
+    width: usize,
+    h: &mut [f32],
+    alpha: f32,
+    activation: Activation,
+) {
+    if width == 4 {
+        dense_forward_chunk_w4(params, h, alpha, activation);
+        return;
+    }
+
     let layer_floats = dense_layer_floats(width);
     let batch = h.len() / width;
     let mut next = vec![0.0; width];
@@ -1342,7 +1484,7 @@ fn dense_forward_chunk(params: &[f32], width: usize, h: &mut [f32], alpha: f32) 
                 for in_idx in 0..width {
                     sum += h[sample_offset + in_idx] * layer[in_idx * width + out_idx];
                 }
-                next[out_idx] = h[sample_offset + out_idx] + alpha * sum.tanh();
+                next[out_idx] = h[sample_offset + out_idx] + alpha * activate(sum, activation);
             }
             h[sample_offset..sample_offset + width].copy_from_slice(&next);
         }
@@ -1356,8 +1498,13 @@ fn dense_backward_chunk(
     end_grad: &[f32],
     batch: usize,
     alpha: f32,
+    activation: Activation,
     lr: f32,
 ) -> Vec<f32> {
+    if width == 4 {
+        return dense_backward_chunk_w4(params, start_h, end_grad, batch, alpha, activation, lr);
+    }
+
     let layer_floats = dense_layer_floats(width);
     let layers = params.len() / layer_floats;
     let stride = batch * width;
@@ -1380,7 +1527,7 @@ fn dense_backward_chunk(
                     sum += activations[prev_sample + in_idx] * layer[in_idx * width + out_idx];
                 }
                 activations[next_sample + out_idx] =
-                    activations[prev_sample + out_idx] + alpha * sum.tanh();
+                    activations[prev_sample + out_idx] + alpha * activate(sum, activation);
             }
         }
     }
@@ -1407,8 +1554,9 @@ fn dense_backward_chunk(
                     sum += activations[h_offset + in_idx]
                         * params[layer_offset + in_idx * width + out_idx];
                 }
-                let a = sum.tanh();
-                du[out_idx] = grad[sample_offset + out_idx] * alpha * (1.0 - a * a);
+                let a = activate(sum, activation);
+                du[out_idx] =
+                    grad[sample_offset + out_idx] * alpha * activate_derivative(sum, a, activation);
                 grad_params[bias_offset + out_idx] += du[out_idx];
             }
 
@@ -1431,6 +1579,660 @@ fn dense_backward_chunk(
     }
 
     grad
+}
+
+fn dense_forward_chunk_w4(params: &[f32], h: &mut [f32], alpha: f32, activation: Activation) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if activation == Activation::Softsign
+            && h.len().is_multiple_of(32)
+            && std::is_x86_feature_detected!("avx2")
+        {
+            unsafe {
+                dense_forward_chunk_w4_softsign_avx2(params, h, alpha);
+            }
+            return;
+        }
+    }
+
+    let batch = h.len() / 4;
+
+    for layer in params.chunks_exact(20) {
+        let w00 = layer[0];
+        let w01 = layer[1];
+        let w02 = layer[2];
+        let w03 = layer[3];
+        let w10 = layer[4];
+        let w11 = layer[5];
+        let w12 = layer[6];
+        let w13 = layer[7];
+        let w20 = layer[8];
+        let w21 = layer[9];
+        let w22 = layer[10];
+        let w23 = layer[11];
+        let w30 = layer[12];
+        let w31 = layer[13];
+        let w32 = layer[14];
+        let w33 = layer[15];
+        let b0 = layer[16];
+        let b1 = layer[17];
+        let b2 = layer[18];
+        let b3 = layer[19];
+
+        for sample_idx in 0..batch {
+            let o = sample_idx * 4;
+            let h0 = h[o];
+            let h1 = h[o + 1];
+            let h2 = h[o + 2];
+            let h3 = h[o + 3];
+
+            let s0 = h0 * w00 + h1 * w10 + h2 * w20 + h3 * w30 + b0;
+            let s1 = h0 * w01 + h1 * w11 + h2 * w21 + h3 * w31 + b1;
+            let s2 = h0 * w02 + h1 * w12 + h2 * w22 + h3 * w32 + b2;
+            let s3 = h0 * w03 + h1 * w13 + h2 * w23 + h3 * w33 + b3;
+
+            h[o] = h0 + alpha * activate(s0, activation);
+            h[o + 1] = h1 + alpha * activate(s1, activation);
+            h[o + 2] = h2 + alpha * activate(s2, activation);
+            h[o + 3] = h3 + alpha * activate(s3, activation);
+        }
+    }
+}
+
+fn dense_backward_chunk_w4(
+    params: &mut [f32],
+    start_h: &[f32],
+    end_grad: &[f32],
+    batch: usize,
+    alpha: f32,
+    activation: Activation,
+    lr: f32,
+) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if activation == Activation::Softsign
+            && batch.is_multiple_of(8)
+            && std::is_x86_feature_detected!("avx2")
+        {
+            return unsafe {
+                dense_backward_chunk_w4_softsign_avx2(params, start_h, end_grad, batch, alpha, lr)
+            };
+        }
+    }
+
+    let layers = params.len() / 20;
+    let stride = batch * 4;
+    let mut activations = vec![0.0; (layers + 1) * stride];
+    activations[..stride].copy_from_slice(start_h);
+
+    for layer_idx in 0..layers {
+        let layer_offset = layer_idx * 20;
+        let prev_offset = layer_idx * stride;
+        let next_offset = (layer_idx + 1) * stride;
+        let layer = &params[layer_offset..layer_offset + 20];
+
+        let w00 = layer[0];
+        let w01 = layer[1];
+        let w02 = layer[2];
+        let w03 = layer[3];
+        let w10 = layer[4];
+        let w11 = layer[5];
+        let w12 = layer[6];
+        let w13 = layer[7];
+        let w20 = layer[8];
+        let w21 = layer[9];
+        let w22 = layer[10];
+        let w23 = layer[11];
+        let w30 = layer[12];
+        let w31 = layer[13];
+        let w32 = layer[14];
+        let w33 = layer[15];
+        let b0 = layer[16];
+        let b1 = layer[17];
+        let b2 = layer[18];
+        let b3 = layer[19];
+
+        for sample_idx in 0..batch {
+            let p = prev_offset + sample_idx * 4;
+            let n = next_offset + sample_idx * 4;
+            let h0 = activations[p];
+            let h1 = activations[p + 1];
+            let h2 = activations[p + 2];
+            let h3 = activations[p + 3];
+
+            let s0 = h0 * w00 + h1 * w10 + h2 * w20 + h3 * w30 + b0;
+            let s1 = h0 * w01 + h1 * w11 + h2 * w21 + h3 * w31 + b1;
+            let s2 = h0 * w02 + h1 * w12 + h2 * w22 + h3 * w32 + b2;
+            let s3 = h0 * w03 + h1 * w13 + h2 * w23 + h3 * w33 + b3;
+
+            activations[n] = h0 + alpha * activate(s0, activation);
+            activations[n + 1] = h1 + alpha * activate(s1, activation);
+            activations[n + 2] = h2 + alpha * activate(s2, activation);
+            activations[n + 3] = h3 + alpha * activate(s3, activation);
+        }
+    }
+
+    let mut grad = end_grad.to_vec();
+    let mut prev_grad = vec![0.0; stride];
+
+    for layer_idx in (0..layers).rev() {
+        let layer_offset = layer_idx * 20;
+        let act_offset = layer_idx * stride;
+
+        let w00 = params[layer_offset];
+        let w01 = params[layer_offset + 1];
+        let w02 = params[layer_offset + 2];
+        let w03 = params[layer_offset + 3];
+        let w10 = params[layer_offset + 4];
+        let w11 = params[layer_offset + 5];
+        let w12 = params[layer_offset + 6];
+        let w13 = params[layer_offset + 7];
+        let w20 = params[layer_offset + 8];
+        let w21 = params[layer_offset + 9];
+        let w22 = params[layer_offset + 10];
+        let w23 = params[layer_offset + 11];
+        let w30 = params[layer_offset + 12];
+        let w31 = params[layer_offset + 13];
+        let w32 = params[layer_offset + 14];
+        let w33 = params[layer_offset + 15];
+        let b0 = params[layer_offset + 16];
+        let b1 = params[layer_offset + 17];
+        let b2 = params[layer_offset + 18];
+        let b3 = params[layer_offset + 19];
+
+        let mut gw00 = 0.0;
+        let mut gw01 = 0.0;
+        let mut gw02 = 0.0;
+        let mut gw03 = 0.0;
+        let mut gw10 = 0.0;
+        let mut gw11 = 0.0;
+        let mut gw12 = 0.0;
+        let mut gw13 = 0.0;
+        let mut gw20 = 0.0;
+        let mut gw21 = 0.0;
+        let mut gw22 = 0.0;
+        let mut gw23 = 0.0;
+        let mut gw30 = 0.0;
+        let mut gw31 = 0.0;
+        let mut gw32 = 0.0;
+        let mut gw33 = 0.0;
+        let mut gb0 = 0.0;
+        let mut gb1 = 0.0;
+        let mut gb2 = 0.0;
+        let mut gb3 = 0.0;
+
+        for sample_idx in 0..batch {
+            let o = sample_idx * 4;
+            let h = act_offset + o;
+            let h0 = activations[h];
+            let h1 = activations[h + 1];
+            let h2 = activations[h + 2];
+            let h3 = activations[h + 3];
+
+            let s0 = h0 * w00 + h1 * w10 + h2 * w20 + h3 * w30 + b0;
+            let s1 = h0 * w01 + h1 * w11 + h2 * w21 + h3 * w31 + b1;
+            let s2 = h0 * w02 + h1 * w12 + h2 * w22 + h3 * w32 + b2;
+            let s3 = h0 * w03 + h1 * w13 + h2 * w23 + h3 * w33 + b3;
+
+            let a0 = activate(s0, activation);
+            let a1 = activate(s1, activation);
+            let a2 = activate(s2, activation);
+            let a3 = activate(s3, activation);
+
+            let du0 = grad[o] * alpha * activate_derivative(s0, a0, activation);
+            let du1 = grad[o + 1] * alpha * activate_derivative(s1, a1, activation);
+            let du2 = grad[o + 2] * alpha * activate_derivative(s2, a2, activation);
+            let du3 = grad[o + 3] * alpha * activate_derivative(s3, a3, activation);
+
+            gw00 += h0 * du0;
+            gw01 += h0 * du1;
+            gw02 += h0 * du2;
+            gw03 += h0 * du3;
+            gw10 += h1 * du0;
+            gw11 += h1 * du1;
+            gw12 += h1 * du2;
+            gw13 += h1 * du3;
+            gw20 += h2 * du0;
+            gw21 += h2 * du1;
+            gw22 += h2 * du2;
+            gw23 += h2 * du3;
+            gw30 += h3 * du0;
+            gw31 += h3 * du1;
+            gw32 += h3 * du2;
+            gw33 += h3 * du3;
+            gb0 += du0;
+            gb1 += du1;
+            gb2 += du2;
+            gb3 += du3;
+
+            prev_grad[o] = grad[o] + du0 * w00 + du1 * w01 + du2 * w02 + du3 * w03;
+            prev_grad[o + 1] = grad[o + 1] + du0 * w10 + du1 * w11 + du2 * w12 + du3 * w13;
+            prev_grad[o + 2] = grad[o + 2] + du0 * w20 + du1 * w21 + du2 * w22 + du3 * w23;
+            prev_grad[o + 3] = grad[o + 3] + du0 * w30 + du1 * w31 + du2 * w32 + du3 * w33;
+        }
+
+        params[layer_offset] -= lr * gw00;
+        params[layer_offset + 1] -= lr * gw01;
+        params[layer_offset + 2] -= lr * gw02;
+        params[layer_offset + 3] -= lr * gw03;
+        params[layer_offset + 4] -= lr * gw10;
+        params[layer_offset + 5] -= lr * gw11;
+        params[layer_offset + 6] -= lr * gw12;
+        params[layer_offset + 7] -= lr * gw13;
+        params[layer_offset + 8] -= lr * gw20;
+        params[layer_offset + 9] -= lr * gw21;
+        params[layer_offset + 10] -= lr * gw22;
+        params[layer_offset + 11] -= lr * gw23;
+        params[layer_offset + 12] -= lr * gw30;
+        params[layer_offset + 13] -= lr * gw31;
+        params[layer_offset + 14] -= lr * gw32;
+        params[layer_offset + 15] -= lr * gw33;
+        params[layer_offset + 16] -= lr * gb0;
+        params[layer_offset + 17] -= lr * gb1;
+        params[layer_offset + 18] -= lr * gb2;
+        params[layer_offset + 19] -= lr * gb3;
+
+        std::mem::swap(&mut grad, &mut prev_grad);
+    }
+
+    grad
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dense_forward_chunk_w4_softsign_avx2(params: &[f32], h: &mut [f32], alpha: f32) {
+    use std::arch::x86_64::*;
+
+    let batch = h.len() / 4;
+    let mut h0 = vec![0.0f32; batch];
+    let mut h1 = vec![0.0f32; batch];
+    let mut h2 = vec![0.0f32; batch];
+    let mut h3 = vec![0.0f32; batch];
+
+    for sample_idx in 0..batch {
+        let o = sample_idx * 4;
+        h0[sample_idx] = h[o];
+        h1[sample_idx] = h[o + 1];
+        h2[sample_idx] = h[o + 2];
+        h3[sample_idx] = h[o + 3];
+    }
+
+    let alpha_v = _mm256_set1_ps(alpha);
+
+    for layer in params.chunks_exact(20) {
+        let w00 = _mm256_set1_ps(layer[0]);
+        let w01 = _mm256_set1_ps(layer[1]);
+        let w02 = _mm256_set1_ps(layer[2]);
+        let w03 = _mm256_set1_ps(layer[3]);
+        let w10 = _mm256_set1_ps(layer[4]);
+        let w11 = _mm256_set1_ps(layer[5]);
+        let w12 = _mm256_set1_ps(layer[6]);
+        let w13 = _mm256_set1_ps(layer[7]);
+        let w20 = _mm256_set1_ps(layer[8]);
+        let w21 = _mm256_set1_ps(layer[9]);
+        let w22 = _mm256_set1_ps(layer[10]);
+        let w23 = _mm256_set1_ps(layer[11]);
+        let w30 = _mm256_set1_ps(layer[12]);
+        let w31 = _mm256_set1_ps(layer[13]);
+        let w32 = _mm256_set1_ps(layer[14]);
+        let w33 = _mm256_set1_ps(layer[15]);
+        let b0 = _mm256_set1_ps(layer[16]);
+        let b1 = _mm256_set1_ps(layer[17]);
+        let b2 = _mm256_set1_ps(layer[18]);
+        let b3 = _mm256_set1_ps(layer[19]);
+
+        for base in (0..batch).step_by(8) {
+            let x0 = _mm256_loadu_ps(h0.as_ptr().add(base));
+            let x1 = _mm256_loadu_ps(h1.as_ptr().add(base));
+            let x2 = _mm256_loadu_ps(h2.as_ptr().add(base));
+            let x3 = _mm256_loadu_ps(h3.as_ptr().add(base));
+
+            let s0 = avx2_sum4(x0, w00, x1, w10, x2, w20, x3, w30, b0);
+            let s1 = avx2_sum4(x0, w01, x1, w11, x2, w21, x3, w31, b1);
+            let s2 = avx2_sum4(x0, w02, x1, w12, x2, w22, x3, w32, b2);
+            let s3 = avx2_sum4(x0, w03, x1, w13, x2, w23, x3, w33, b3);
+
+            _mm256_storeu_ps(
+                h0.as_mut_ptr().add(base),
+                _mm256_add_ps(x0, _mm256_mul_ps(alpha_v, avx2_softsign(s0))),
+            );
+            _mm256_storeu_ps(
+                h1.as_mut_ptr().add(base),
+                _mm256_add_ps(x1, _mm256_mul_ps(alpha_v, avx2_softsign(s1))),
+            );
+            _mm256_storeu_ps(
+                h2.as_mut_ptr().add(base),
+                _mm256_add_ps(x2, _mm256_mul_ps(alpha_v, avx2_softsign(s2))),
+            );
+            _mm256_storeu_ps(
+                h3.as_mut_ptr().add(base),
+                _mm256_add_ps(x3, _mm256_mul_ps(alpha_v, avx2_softsign(s3))),
+            );
+        }
+    }
+
+    for sample_idx in 0..batch {
+        let o = sample_idx * 4;
+        h[o] = h0[sample_idx];
+        h[o + 1] = h1[sample_idx];
+        h[o + 2] = h2[sample_idx];
+        h[o + 3] = h3[sample_idx];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dense_backward_chunk_w4_softsign_avx2(
+    params: &mut [f32],
+    start_h: &[f32],
+    end_grad: &[f32],
+    batch: usize,
+    alpha: f32,
+    lr: f32,
+) -> Vec<f32> {
+    use std::arch::x86_64::*;
+
+    let layers = params.len() / 20;
+    let layer_stride = 4 * batch;
+    let mut activations = vec![0.0f32; (layers + 1) * layer_stride];
+
+    for sample_idx in 0..batch {
+        let src = sample_idx * 4;
+        activations[sample_idx] = start_h[src];
+        activations[batch + sample_idx] = start_h[src + 1];
+        activations[2 * batch + sample_idx] = start_h[src + 2];
+        activations[3 * batch + sample_idx] = start_h[src + 3];
+    }
+
+    let alpha_v = _mm256_set1_ps(alpha);
+
+    for layer_idx in 0..layers {
+        let layer_offset = layer_idx * 20;
+        let prev = layer_idx * layer_stride;
+        let next = (layer_idx + 1) * layer_stride;
+
+        let w00 = _mm256_set1_ps(params[layer_offset]);
+        let w01 = _mm256_set1_ps(params[layer_offset + 1]);
+        let w02 = _mm256_set1_ps(params[layer_offset + 2]);
+        let w03 = _mm256_set1_ps(params[layer_offset + 3]);
+        let w10 = _mm256_set1_ps(params[layer_offset + 4]);
+        let w11 = _mm256_set1_ps(params[layer_offset + 5]);
+        let w12 = _mm256_set1_ps(params[layer_offset + 6]);
+        let w13 = _mm256_set1_ps(params[layer_offset + 7]);
+        let w20 = _mm256_set1_ps(params[layer_offset + 8]);
+        let w21 = _mm256_set1_ps(params[layer_offset + 9]);
+        let w22 = _mm256_set1_ps(params[layer_offset + 10]);
+        let w23 = _mm256_set1_ps(params[layer_offset + 11]);
+        let w30 = _mm256_set1_ps(params[layer_offset + 12]);
+        let w31 = _mm256_set1_ps(params[layer_offset + 13]);
+        let w32 = _mm256_set1_ps(params[layer_offset + 14]);
+        let w33 = _mm256_set1_ps(params[layer_offset + 15]);
+        let b0 = _mm256_set1_ps(params[layer_offset + 16]);
+        let b1 = _mm256_set1_ps(params[layer_offset + 17]);
+        let b2 = _mm256_set1_ps(params[layer_offset + 18]);
+        let b3 = _mm256_set1_ps(params[layer_offset + 19]);
+
+        for base in (0..batch).step_by(8) {
+            let h0 = _mm256_loadu_ps(activations.as_ptr().add(prev + base));
+            let h1 = _mm256_loadu_ps(activations.as_ptr().add(prev + batch + base));
+            let h2 = _mm256_loadu_ps(activations.as_ptr().add(prev + 2 * batch + base));
+            let h3 = _mm256_loadu_ps(activations.as_ptr().add(prev + 3 * batch + base));
+
+            let s0 = avx2_sum4(h0, w00, h1, w10, h2, w20, h3, w30, b0);
+            let s1 = avx2_sum4(h0, w01, h1, w11, h2, w21, h3, w31, b1);
+            let s2 = avx2_sum4(h0, w02, h1, w12, h2, w22, h3, w32, b2);
+            let s3 = avx2_sum4(h0, w03, h1, w13, h2, w23, h3, w33, b3);
+
+            _mm256_storeu_ps(
+                activations.as_mut_ptr().add(next + base),
+                _mm256_add_ps(h0, _mm256_mul_ps(alpha_v, avx2_softsign(s0))),
+            );
+            _mm256_storeu_ps(
+                activations.as_mut_ptr().add(next + batch + base),
+                _mm256_add_ps(h1, _mm256_mul_ps(alpha_v, avx2_softsign(s1))),
+            );
+            _mm256_storeu_ps(
+                activations.as_mut_ptr().add(next + 2 * batch + base),
+                _mm256_add_ps(h2, _mm256_mul_ps(alpha_v, avx2_softsign(s2))),
+            );
+            _mm256_storeu_ps(
+                activations.as_mut_ptr().add(next + 3 * batch + base),
+                _mm256_add_ps(h3, _mm256_mul_ps(alpha_v, avx2_softsign(s3))),
+            );
+        }
+    }
+
+    let mut grad = vec![0.0f32; layer_stride];
+    let mut prev_grad = vec![0.0f32; layer_stride];
+    for sample_idx in 0..batch {
+        let src = sample_idx * 4;
+        grad[sample_idx] = end_grad[src];
+        grad[batch + sample_idx] = end_grad[src + 1];
+        grad[2 * batch + sample_idx] = end_grad[src + 2];
+        grad[3 * batch + sample_idx] = end_grad[src + 3];
+    }
+
+    for layer_idx in (0..layers).rev() {
+        let layer_offset = layer_idx * 20;
+        let act = layer_idx * layer_stride;
+
+        let w00s = params[layer_offset];
+        let w01s = params[layer_offset + 1];
+        let w02s = params[layer_offset + 2];
+        let w03s = params[layer_offset + 3];
+        let w10s = params[layer_offset + 4];
+        let w11s = params[layer_offset + 5];
+        let w12s = params[layer_offset + 6];
+        let w13s = params[layer_offset + 7];
+        let w20s = params[layer_offset + 8];
+        let w21s = params[layer_offset + 9];
+        let w22s = params[layer_offset + 10];
+        let w23s = params[layer_offset + 11];
+        let w30s = params[layer_offset + 12];
+        let w31s = params[layer_offset + 13];
+        let w32s = params[layer_offset + 14];
+        let w33s = params[layer_offset + 15];
+        let b0s = params[layer_offset + 16];
+        let b1s = params[layer_offset + 17];
+        let b2s = params[layer_offset + 18];
+        let b3s = params[layer_offset + 19];
+
+        let w00 = _mm256_set1_ps(w00s);
+        let w01 = _mm256_set1_ps(w01s);
+        let w02 = _mm256_set1_ps(w02s);
+        let w03 = _mm256_set1_ps(w03s);
+        let w10 = _mm256_set1_ps(w10s);
+        let w11 = _mm256_set1_ps(w11s);
+        let w12 = _mm256_set1_ps(w12s);
+        let w13 = _mm256_set1_ps(w13s);
+        let w20 = _mm256_set1_ps(w20s);
+        let w21 = _mm256_set1_ps(w21s);
+        let w22 = _mm256_set1_ps(w22s);
+        let w23 = _mm256_set1_ps(w23s);
+        let w30 = _mm256_set1_ps(w30s);
+        let w31 = _mm256_set1_ps(w31s);
+        let w32 = _mm256_set1_ps(w32s);
+        let w33 = _mm256_set1_ps(w33s);
+        let b0 = _mm256_set1_ps(b0s);
+        let b1 = _mm256_set1_ps(b1s);
+        let b2 = _mm256_set1_ps(b2s);
+        let b3 = _mm256_set1_ps(b3s);
+
+        let mut gw00 = _mm256_setzero_ps();
+        let mut gw01 = _mm256_setzero_ps();
+        let mut gw02 = _mm256_setzero_ps();
+        let mut gw03 = _mm256_setzero_ps();
+        let mut gw10 = _mm256_setzero_ps();
+        let mut gw11 = _mm256_setzero_ps();
+        let mut gw12 = _mm256_setzero_ps();
+        let mut gw13 = _mm256_setzero_ps();
+        let mut gw20 = _mm256_setzero_ps();
+        let mut gw21 = _mm256_setzero_ps();
+        let mut gw22 = _mm256_setzero_ps();
+        let mut gw23 = _mm256_setzero_ps();
+        let mut gw30 = _mm256_setzero_ps();
+        let mut gw31 = _mm256_setzero_ps();
+        let mut gw32 = _mm256_setzero_ps();
+        let mut gw33 = _mm256_setzero_ps();
+        let mut gb0 = _mm256_setzero_ps();
+        let mut gb1 = _mm256_setzero_ps();
+        let mut gb2 = _mm256_setzero_ps();
+        let mut gb3 = _mm256_setzero_ps();
+
+        for base in (0..batch).step_by(8) {
+            let h0 = _mm256_loadu_ps(activations.as_ptr().add(act + base));
+            let h1 = _mm256_loadu_ps(activations.as_ptr().add(act + batch + base));
+            let h2 = _mm256_loadu_ps(activations.as_ptr().add(act + 2 * batch + base));
+            let h3 = _mm256_loadu_ps(activations.as_ptr().add(act + 3 * batch + base));
+            let g0 = _mm256_loadu_ps(grad.as_ptr().add(base));
+            let g1 = _mm256_loadu_ps(grad.as_ptr().add(batch + base));
+            let g2 = _mm256_loadu_ps(grad.as_ptr().add(2 * batch + base));
+            let g3 = _mm256_loadu_ps(grad.as_ptr().add(3 * batch + base));
+
+            let s0 = avx2_sum4(h0, w00, h1, w10, h2, w20, h3, w30, b0);
+            let s1 = avx2_sum4(h0, w01, h1, w11, h2, w21, h3, w31, b1);
+            let s2 = avx2_sum4(h0, w02, h1, w12, h2, w22, h3, w32, b2);
+            let s3 = avx2_sum4(h0, w03, h1, w13, h2, w23, h3, w33, b3);
+
+            let du0 = _mm256_mul_ps(_mm256_mul_ps(g0, alpha_v), avx2_softsign_derivative(s0));
+            let du1 = _mm256_mul_ps(_mm256_mul_ps(g1, alpha_v), avx2_softsign_derivative(s1));
+            let du2 = _mm256_mul_ps(_mm256_mul_ps(g2, alpha_v), avx2_softsign_derivative(s2));
+            let du3 = _mm256_mul_ps(_mm256_mul_ps(g3, alpha_v), avx2_softsign_derivative(s3));
+
+            gw00 = _mm256_add_ps(gw00, _mm256_mul_ps(h0, du0));
+            gw01 = _mm256_add_ps(gw01, _mm256_mul_ps(h0, du1));
+            gw02 = _mm256_add_ps(gw02, _mm256_mul_ps(h0, du2));
+            gw03 = _mm256_add_ps(gw03, _mm256_mul_ps(h0, du3));
+            gw10 = _mm256_add_ps(gw10, _mm256_mul_ps(h1, du0));
+            gw11 = _mm256_add_ps(gw11, _mm256_mul_ps(h1, du1));
+            gw12 = _mm256_add_ps(gw12, _mm256_mul_ps(h1, du2));
+            gw13 = _mm256_add_ps(gw13, _mm256_mul_ps(h1, du3));
+            gw20 = _mm256_add_ps(gw20, _mm256_mul_ps(h2, du0));
+            gw21 = _mm256_add_ps(gw21, _mm256_mul_ps(h2, du1));
+            gw22 = _mm256_add_ps(gw22, _mm256_mul_ps(h2, du2));
+            gw23 = _mm256_add_ps(gw23, _mm256_mul_ps(h2, du3));
+            gw30 = _mm256_add_ps(gw30, _mm256_mul_ps(h3, du0));
+            gw31 = _mm256_add_ps(gw31, _mm256_mul_ps(h3, du1));
+            gw32 = _mm256_add_ps(gw32, _mm256_mul_ps(h3, du2));
+            gw33 = _mm256_add_ps(gw33, _mm256_mul_ps(h3, du3));
+            gb0 = _mm256_add_ps(gb0, du0);
+            gb1 = _mm256_add_ps(gb1, du1);
+            gb2 = _mm256_add_ps(gb2, du2);
+            gb3 = _mm256_add_ps(gb3, du3);
+
+            _mm256_storeu_ps(
+                prev_grad.as_mut_ptr().add(base),
+                avx2_sum4(du0, w00, du1, w01, du2, w02, du3, w03, g0),
+            );
+            _mm256_storeu_ps(
+                prev_grad.as_mut_ptr().add(batch + base),
+                avx2_sum4(du0, w10, du1, w11, du2, w12, du3, w13, g1),
+            );
+            _mm256_storeu_ps(
+                prev_grad.as_mut_ptr().add(2 * batch + base),
+                avx2_sum4(du0, w20, du1, w21, du2, w22, du3, w23, g2),
+            );
+            _mm256_storeu_ps(
+                prev_grad.as_mut_ptr().add(3 * batch + base),
+                avx2_sum4(du0, w30, du1, w31, du2, w32, du3, w33, g3),
+            );
+        }
+
+        params[layer_offset] -= lr * avx2_horizontal_sum(gw00);
+        params[layer_offset + 1] -= lr * avx2_horizontal_sum(gw01);
+        params[layer_offset + 2] -= lr * avx2_horizontal_sum(gw02);
+        params[layer_offset + 3] -= lr * avx2_horizontal_sum(gw03);
+        params[layer_offset + 4] -= lr * avx2_horizontal_sum(gw10);
+        params[layer_offset + 5] -= lr * avx2_horizontal_sum(gw11);
+        params[layer_offset + 6] -= lr * avx2_horizontal_sum(gw12);
+        params[layer_offset + 7] -= lr * avx2_horizontal_sum(gw13);
+        params[layer_offset + 8] -= lr * avx2_horizontal_sum(gw20);
+        params[layer_offset + 9] -= lr * avx2_horizontal_sum(gw21);
+        params[layer_offset + 10] -= lr * avx2_horizontal_sum(gw22);
+        params[layer_offset + 11] -= lr * avx2_horizontal_sum(gw23);
+        params[layer_offset + 12] -= lr * avx2_horizontal_sum(gw30);
+        params[layer_offset + 13] -= lr * avx2_horizontal_sum(gw31);
+        params[layer_offset + 14] -= lr * avx2_horizontal_sum(gw32);
+        params[layer_offset + 15] -= lr * avx2_horizontal_sum(gw33);
+        params[layer_offset + 16] -= lr * avx2_horizontal_sum(gb0);
+        params[layer_offset + 17] -= lr * avx2_horizontal_sum(gb1);
+        params[layer_offset + 18] -= lr * avx2_horizontal_sum(gb2);
+        params[layer_offset + 19] -= lr * avx2_horizontal_sum(gb3);
+
+        std::mem::swap(&mut grad, &mut prev_grad);
+    }
+
+    let mut out = vec![0.0f32; layer_stride];
+    for sample_idx in 0..batch {
+        let dst = sample_idx * 4;
+        out[dst] = grad[sample_idx];
+        out[dst + 1] = grad[batch + sample_idx];
+        out[dst + 2] = grad[2 * batch + sample_idx];
+        out[dst + 3] = grad[3 * batch + sample_idx];
+    }
+
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn avx2_softsign(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_ps(1.0);
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let abs_x = _mm256_andnot_ps(sign_mask, x);
+    _mm256_div_ps(x, _mm256_add_ps(one, abs_x))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn avx2_softsign_derivative(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_ps(1.0);
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let abs_x = _mm256_andnot_ps(sign_mask, x);
+    let denom = _mm256_add_ps(one, abs_x);
+    _mm256_div_ps(one, _mm256_mul_ps(denom, denom))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn avx2_sum4(
+    x0: std::arch::x86_64::__m256,
+    w0: std::arch::x86_64::__m256,
+    x1: std::arch::x86_64::__m256,
+    w1: std::arch::x86_64::__m256,
+    x2: std::arch::x86_64::__m256,
+    w2: std::arch::x86_64::__m256,
+    x3: std::arch::x86_64::__m256,
+    w3: std::arch::x86_64::__m256,
+    bias: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    _mm256_add_ps(
+        _mm256_add_ps(
+            _mm256_add_ps(_mm256_mul_ps(x0, w0), _mm256_mul_ps(x1, w1)),
+            _mm256_add_ps(_mm256_mul_ps(x2, w2), _mm256_mul_ps(x3, w3)),
+        ),
+        bias,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn avx2_horizontal_sum(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let sum1 = _mm256_hadd_ps(v, v);
+    let sum2 = _mm256_hadd_ps(sum1, sum1);
+    let hi = _mm256_extractf128_ps(sum2, 1);
+    let lo = _mm256_castps256_ps128(sum2);
+    _mm_cvtss_f32(_mm_add_ss(lo, hi))
 }
 
 fn dense_output_loss_backward_update(
@@ -1726,6 +2528,31 @@ fn softmax_loss_gradient(
     }
 
     (loss, predicted, grad)
+}
+
+fn activate(x: f32, activation: Activation) -> f32 {
+    match activation {
+        Activation::Tanh => x.tanh(),
+        Activation::Softsign => x / (1.0 + x.abs()),
+        Activation::Relu => x.max(0.0),
+    }
+}
+
+fn activate_derivative(x: f32, y: f32, activation: Activation) -> f32 {
+    match activation {
+        Activation::Tanh => 1.0 - y * y,
+        Activation::Softsign => {
+            let denom = 1.0 + x.abs();
+            1.0 / (denom * denom)
+        }
+        Activation::Relu => {
+            if x > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
 }
 
 fn train_step(
@@ -2269,6 +3096,17 @@ fn write_dense_chunk(file: &File, start_layer: u64, width: usize, params: &[f32]
     Ok(())
 }
 
+fn read_all_dense_weights(file: &File, layers: u64, width: usize) -> Result<Vec<f32>> {
+    let mut weights = vec![0.0f32; dense_total_floats(layers, width)?];
+    read_exact_at_all(file, bytemuck::cast_slice_mut(&mut weights), 0)?;
+    Ok(weights)
+}
+
+fn write_all_dense_weights(file: &File, weights: &[f32]) -> Result<()> {
+    write_all_at_all(file, bytemuck::cast_slice(weights), 0)?;
+    Ok(())
+}
+
 fn dense_layer_floats(width: usize) -> usize {
     width * width + width
 }
@@ -2285,6 +3123,13 @@ fn dense_total_bytes(layers: u64, width: usize) -> Result<u64> {
     layers
         .checked_mul(dense_layer_bytes(width)?)
         .ok_or_else(|| "dense layer file would overflow u64 length".into())
+}
+
+fn dense_total_floats(layers: u64, width: usize) -> Result<usize> {
+    let floats = layers
+        .checked_mul(dense_layer_floats(width) as u64)
+        .ok_or("dense layer float count would overflow u64")?;
+    usize::try_from(floats).map_err(|_| "dense layer float count would overflow usize".into())
 }
 
 fn dense_byte_offset(start_layer: u64, width: usize) -> Result<u64> {

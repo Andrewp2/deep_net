@@ -1,16 +1,28 @@
 # deep_net
 
-Disk-backed experiment for training an absurdly deep width-2 residual network on
-MNIST.
+Experiment for training absurdly deep residual networks on MNIST. The current
+main target is a 10-million-layer dense width-4 residual network whose counted
+core does the actual classification work.
 
-Each counted layer is:
+Each counted dense layer is:
 
 ```text
-h = h + alpha * tanh(h W_i + b_i)
+h = h + alpha * activation(h W_i + b_i)
 ```
 
-with `h` width 2 and six `f32` parameters per layer. A 100M-layer file is
-2.4 GB.
+For the current run:
+
+```text
+layers:     10,000,000
+width:      4
+activation: softsign
+batch:      16
+optimizer:  exact SGD
+weights:    0.8 GB
+```
+
+The width-4 softsign path uses a hand-written AVX2 batch-lane kernel and can
+load the full weight file into RAM for training.
 
 ## Quick smoke test
 
@@ -25,7 +37,61 @@ cargo run --release -- train \
   --train-limit 128
 ```
 
-## 100M-layer run
+## Main Run
+
+This is the run to try first. It trains a 10M-layer width-4 residual core for
+1000 minibatches, then writes the weights back to disk:
+
+```sh
+cargo run --release -- train-dense \
+  --layers 10000000 \
+  --width 4 \
+  --weights /media/andrew-peterson/HardDrive/deep_net/weights_10m_w4_softsign.bin \
+  --head /media/andrew-peterson/HardDrive/deep_net/head_10m_w4_softsign.bin \
+  --data-dir data/mnist \
+  --steps 1000 \
+  --batch 16 \
+  --chunk-layers 100000 \
+  --activation softsign \
+  --layer-lr 0.01 \
+  --head-lr 0.01 \
+  --report-every 10 \
+  --in-memory
+```
+
+Then evaluate on the full 10,000-image MNIST test set:
+
+```sh
+cargo run --release -- eval-dense \
+  --layers 10000000 \
+  --width 4 \
+  --weights /media/andrew-peterson/HardDrive/deep_net/weights_10m_w4_softsign.bin \
+  --head /media/andrew-peterson/HardDrive/deep_net/head_10m_w4_softsign.bin \
+  --data-dir data/mnist \
+  --samples 10000 \
+  --batch 256 \
+  --chunk-layers 100000 \
+  --activation softsign
+```
+
+Expected runtime on this machine:
+
+```text
+step time:        ~1.0-1.2s
+1000-step train:  ~17-20 min of step time
+RAM use:          ~1 GB resident
+```
+
+Completed 1000-step result:
+
+```text
+final train minibatch loss: 0.846
+test loss:                  0.965448
+test acc:                   0.701
+test eval time:             69.17s
+```
+
+## Width-2 100M Run
 
 Put the large weight file on the mounted hard drive:
 
@@ -100,16 +166,18 @@ This is the practical-good-loss path, not the pure streamed width-2 core. The
 honest next step is to splice the good MNIST head into the deep experiment as a
 residual/identity branch, or to widen the counted core beyond 2.
 
-## Dense Width 32/64 Core
+## Dense Core Notes
 
 For the version where the counted layers do the real work, use the dense core:
 
 ```text
-h = h + alpha * tanh(h W_i + b_i)
+h = h + alpha * activation(h W_i + b_i)
 ```
 
 where `h` has configurable width and each counted layer has a full dense
-`width x width` matrix plus bias.
+`width x width` matrix plus bias. Use the 10M-layer width-4 command in
+`Main Run` for the current depth stunt; the shorter command below is just a
+quick dense-core learning check.
 
 ```sh
 cargo run --release -- train-dense \
@@ -124,6 +192,41 @@ cargo run --release -- train-dense \
   --head-lr 0.01 \
   --report-every 200
 ```
+
+For the long width-4 depth stunt, `softsign` is the current default. It keeps
+the same residual dense-layer shape but avoids billions of expensive `tanh`
+calls.
+
+Calibration on this machine:
+
+```text
+10M width-4 tanh step:     28.46s with native release build
+10M width-4 softsign step: 10.76s with native release build
+10M width-4 ReLU step:     11.11s with native release build
+10M width-4 softsign step:  5.3s with native release + width-4 unrolled kernel
+10M width-4 softsign step:  1.9-2.1s with AVX2 batch-lane kernel
+10M width-4 softsign step:  1.0-1.2s with AVX2 + in-memory weights
+```
+
+On the 100-layer width-4 learning sweep:
+
+```text
+tanh:     loss 0.963126, acc 0.704
+softsign: loss 1.007459, acc 0.694
+ReLU:     loss 1.189358, acc 0.651
+```
+
+ReLU is almost as fast as softsign, but it learned worse in the quick width-4
+sweep. Softsign is the better default for the long run unless a longer ReLU
+sweep proves otherwise.
+
+The width-4 softsign path has a hand-unrolled AVX2 kernel over the batch
+dimension. It processes 8 MNIST samples per vector lane group and falls back to
+the scalar unrolled kernel for non-AVX2 machines or non-softsign activations.
+
+`--in-memory` loads the full dense weight file into RAM, trains there, and
+writes it back once at the end. For 10M width-4 this uses about 1 GB resident
+memory and avoids per-step file writeback.
 
 A 10k-layer width-32 smoke run reached:
 
